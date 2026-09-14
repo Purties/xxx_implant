@@ -24,3 +24,5 @@ xxx/
 implant/out/
 implant/*.dll
 implant/*.exe
+
+implant/hooktest.exe
