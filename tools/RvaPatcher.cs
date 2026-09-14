@@ -8,9 +8,18 @@
 // `lea rax,[rbx+disp32]` immediates to the newly-resolved RVAs, repeatedly, so hook install
 // (which lazily reads the dispatch at ~2.5s) picks up the corrected values.
 //
+// Detection is two-tier:
+//   A) fast path: region-base signature check (region start == allocation base, sig at +0x183FC0)
+//   B) fallback:  full content scan of every readable MEM_PRIVATE region (1MB chunks, overlap-safe)
+//                 searching the SHA-256 anchor anywhere; DLL base = hit - 0x183FC0. This works no
+//                 matter how the manual mapper laid the image out (offset-in-allocation, split
+//                 per-section protection, late copy-in).
+// A logfile is ALWAYS written (patcher_run_<timestamp>.log next to the exe) unless --no-logfile,
+// so a failed run leaves evidence instead of a vanished console window.
+//
 // Build: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /out:RvaPatcher.exe RvaPatcher.cs
-// Usage (admin):  RvaPatcher.exe                      -> wait for Maplestory_Classic.exe, patch, watch 15s
-//                 RvaPatcher.exe MapleStory --duration 20
+// Usage (admin):  RvaPatcher.exe                      -> wait for Maplestory_Classic.exe, patch, watch 20s
+//                 RvaPatcher.exe MapleStory --duration 30
 //                 RvaPatcher.exe --verify-only        -> report current disp32 values, no writes
 // Workflow: run this FIRST, then start the game/injection via ControlProc as usual.
 using System;
@@ -207,6 +216,121 @@ internal static class RvaPatcher
         if (shown == 0) Log("    (no private committed regions)");
     }
 
+    private static int IndexOf(byte[] hay, int len, byte[] needle)
+    {
+        int last = len - needle.Length;
+        if (last < 0) return -1;
+        for (int i = 0; i <= last; i++)
+        {
+            if (hay[i] != needle[0]) continue;
+            int j = 1;
+            for (; j < needle.Length; j++) if (hay[i + j] != needle[j]) break;
+            if (j == needle.Length) return i;
+        }
+        return -1;
+    }
+
+    // Fallback detection (tier B): full content scan of every readable MEM_PRIVATE region.
+    // Does NOT assume the DLL image starts at an allocation base or occupies one region:
+    // the signature anchor is searched anywhere; candidate DLL base = hit - SignatureOffset.
+    // Candidates are validated by checking the first dispatch lea bytes at base+0x127CDB.
+    // Chunk-boundary safe: the last (sigLen-1) bytes of each chunk are carried over.
+    private static List<long> FindDllBasesContentScan(IntPtr hProc)
+    {
+        List<long> found = new List<long>();
+        const int CHUNK = 0x100000; // 1MB
+        int overlap = Signature.Length - 1;
+        byte[] chunk = new byte[CHUNK];
+        byte[] tail = new byte[overlap];
+        byte[] window = new byte[CHUNK + overlap];
+        long addr = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        int mbiSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+        long scanned = 0;
+        while (VirtualQueryEx(hProc, new IntPtr(addr), out mbi, new IntPtr(mbiSize)) != IntPtr.Zero)
+        {
+            long regionBase = mbi.BaseAddress.ToInt64();
+            long regionSize = (long)mbi.RegionSize.ToUInt64();
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE
+                && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0)
+            {
+                long pos = 0;
+                bool haveTail = false;
+                while (pos < regionSize)
+                {
+                    int want = (int)Math.Min(CHUNK, regionSize - pos);
+                    IntPtr rd;
+                    if (!ReadProcessMemory(hProc, new IntPtr(regionBase + pos), chunk, new IntPtr(want), out rd) || rd.ToInt64() != want)
+                    {
+                        pos += want;
+                        haveTail = false;
+                        continue;
+                    }
+                    scanned += want;
+                    // assemble search window: [tail][chunk]
+                    int winLen;
+                    long winStartAbs; // absolute address of window[0]
+                    if (haveTail)
+                    {
+                        Array.Copy(tail, 0, window, 0, overlap);
+                        Array.Copy(chunk, 0, window, overlap, want);
+                        winLen = overlap + want;
+                        winStartAbs = regionBase + pos - overlap;
+                    }
+                    else
+                    {
+                        Array.Copy(chunk, 0, window, 0, want);
+                        winLen = want;
+                        winStartAbs = regionBase + pos;
+                    }
+                    int idx = IndexOf(window, winLen, Signature);
+                    while (idx >= 0)
+                    {
+                        long hitAbs = winStartAbs + idx;
+                        long candBase = hitAbs - SignatureOffset;
+                        if (!found.Contains(candBase))
+                        {
+                            // validate: first dispatch lea bytes at candBase+0x127CDB
+                            byte[] lea = new byte[3];
+                            IntPtr lr;
+                            bool valid = ReadProcessMemory(hProc, new IntPtr(candBase + 0x127CDB), lea, new IntPtr(3), out lr)
+                                         && lr.ToInt64() == 3 && lea[0] == 0x48 && lea[1] == 0x8D && lea[2] == 0x83;
+                            Log("  content-scan: signature hit at 0x" + hitAbs.ToString("X", CultureInfo.InvariantCulture)
+                                + " -> candidate DLL base 0x" + candBase.ToString("X", CultureInfo.InvariantCulture)
+                                + (valid ? " (lea check OK)" : " (lea check FAILED - stray copy?)"));
+                            if (valid) found.Add(candBase);
+                        }
+                        idx = IndexOfAt(window, winLen, Signature, idx + 1);
+                    }
+                    // carry over the last `overlap` bytes of this chunk
+                    int tailLen = Math.Min(overlap, want);
+                    Array.Copy(chunk, want - tailLen, tail, overlap - tailLen, tailLen);
+                    if (tailLen < overlap) Array.Clear(tail, 0, overlap - tailLen);
+                    haveTail = true;
+                    pos += want;
+                }
+            }
+            long next = regionBase + regionSize;
+            if (next <= addr) break;
+            addr = next;
+        }
+        Log("  content-scan done: scanned 0x" + scanned.ToString("X", CultureInfo.InvariantCulture) + " bytes of private memory");
+        return found;
+    }
+
+    private static int IndexOfAt(byte[] hay, int len, byte[] needle, int start)
+    {
+        int last = len - needle.Length;
+        for (int i = start; i <= last; i++)
+        {
+            if (hay[i] != needle[0]) continue;
+            int j = 1;
+            for (; j < needle.Length; j++) if (hay[i + j] != needle[j]) break;
+            if (j == needle.Length) return i;
+        }
+        return -1;
+    }
+
     private static bool ReadSite(IntPtr hProc, long dllBase, Site s, out int curDisp)
     {
         curDisp = 0;
@@ -276,12 +400,14 @@ internal static class RvaPatcher
 
     public static int Main(string[] args)
     {
-        // persistent logfile so the patch trail survives console close
+        // persistent logfile so the patch trail survives console close.
+        // ALWAYS on by default (patcher_run_<timestamp>.log next to the exe); --no-logfile disables.
         string logfile = null;
         System.IO.StreamWriter logWriter = null;
         string procName = "Maplestory_Classic";
-        int durationSec = 15, intervalMs = 20, waitSec = 180;
+        int durationSec = 20, intervalMs = 20, waitSec = 180;
         bool verifyOnly = false;
+        bool noLogfile = false;
         List<string> positional = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
@@ -289,16 +415,35 @@ internal static class RvaPatcher
             else if (args[i] == "--interval" && i + 1 < args.Length) intervalMs = int.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (args[i] == "--wait" && i + 1 < args.Length) waitSec = int.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (args[i] == "--logfile" && i + 1 < args.Length) logfile = args[++i];
+            else if (args[i] == "--no-logfile") noLogfile = true;
             else if (args[i] == "--verify-only") verifyOnly = true;
             else if (!args[i].StartsWith("--")) positional.Add(args[i]);
         }
         if (positional.Count > 0) procName = positional[0];
+        if (!noLogfile && logfile == null)
+        {
+            try
+            {
+                string exeDir = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+                logfile = System.IO.Path.Combine(exeDir, "patcher_run_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".log");
+            }
+            catch { /* fall back to console-only */ }
+        }
         if (logfile != null)
         {
-            logWriter = new System.IO.StreamWriter(logfile, true, Encoding.UTF8);
-            logWriter.AutoFlush = true;
-            Log = s => { Console.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s); logWriter.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s); };
+            try
+            {
+                logWriter = new System.IO.StreamWriter(logfile, true, Encoding.UTF8);
+                logWriter.AutoFlush = true;
+            }
+            catch { logWriter = null; }
+        }
+        if (logWriter != null)
+        {
+            System.IO.StreamWriter lw = logWriter;
+            Log = s => { Console.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s); lw.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s); };
             Log("==== RvaPatcher session start ====");
+            Log("logfile: " + logfile);
         }
 
         Log("target=" + procName + " duration=" + durationSec + "s interval=" + intervalMs + "ms wait=" + waitSec + "s verifyOnly=" + verifyOnly);
@@ -329,14 +474,38 @@ internal static class RvaPatcher
 
         HashSet<long> checkedRegions = new HashSet<long>();
         List<long> bases = new List<long>();
+        DateTime procSeenAt = DateTime.Now;      // when the game process first appeared
+        DateTime lastContentScan = DateTime.MinValue;
         while (DateTime.Now < waitDeadline && bases.Count == 0)
         {
+            // tier A: fast region-base signature check (cheap, every poll)
             bases = FindDllBases(hProc, checkedRegions);
-            if (bases.Count == 0) Thread.Sleep(100);
+            if (bases.Count > 0) { Log("detection: fast path (region-base signature) hit"); break; }
+
+            // tier B: full content scan fallback. Triggered once the process has been alive long
+            // enough for the injection to have landed (~3s: hooks install at ~2.7s), then retried
+            // every 3s. This catches images mapped at an offset inside a larger allocation or with
+            // per-section protection, which the fast path's regionBase==AllocationBase test misses.
+            double aliveSec = (DateTime.Now - procSeenAt).TotalSeconds;
+            if (aliveSec >= 3.0 && (DateTime.Now - lastContentScan).TotalSeconds >= 3.0)
+            {
+                lastContentScan = DateTime.Now;
+                Log("detection: fast path empty after " + aliveSec.ToString("F1") + "s - running full content scan (tier B)...");
+                bases = FindDllBasesContentScan(hProc);
+                if (bases.Count > 0) { Log("detection: content scan hit"); break; }
+            }
+            Thread.Sleep(100);
         }
         if (bases.Count == 0)
         {
             Log("ERROR: injected DLL signature not found within wait window.");
+            Log("running one final full content scan before giving up...");
+            bases = FindDllBasesContentScan(hProc);
+        }
+        if (bases.Count == 0)
+        {
+            Log("ERROR: still not found after final content scan. The DLL was likely never injected");
+            Log("       (ControlProc injection not started / failed), OR it lives in non-private memory.");
             DumpPrivateAllocs(hProc, 12);
             CloseHandle(hProc);
             if (logWriter != null) logWriter.Close();
