@@ -1,0 +1,14 @@
+# 大二进制样本（原始文件/解包映像/游戏DLL备份/内存转储）
+*.exe
+*.dll
+*.bin
+*.dat
+*.zip
+
+# 内嵌 Python 运行时与第三方工具（免安装环境，本地保留）
+tools/python/
+tools/il2cppdumper/
+tools/get-pip.py
+
+# xxx 为独立 git 仓库（交接文档与观测产物），外层不跟踪
+xxx/
