@@ -12,6 +12,10 @@ tools/get-pip.py
 
 # RvaPatcher 运行日志（现场产物，不入库）
 tools/patcher_run_*.log
+tools/phase0_smoke.log
+
+# MinGW 工具链（本地构建环境，不入库）
+tools/mingw64/
 
 # xxx 为独立 git 仓库（交接文档与观测产物），外层不跟踪
 xxx/
