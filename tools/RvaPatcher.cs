@@ -11,17 +11,20 @@
 // Detection is two-tier:
 //   A) fast path: region-base signature check (region start == allocation base, sig at +0x183FC0)
 //   B) fallback:  full content scan of every readable MEM_PRIVATE region (1MB chunks, overlap-safe)
-//                 searching the SHA-256 anchor anywhere; DLL base = hit - 0x183FC0. This works no
-//                 matter how the manual mapper laid the image out (offset-in-allocation, split
-//                 per-section protection, late copy-in).
+//                 searching lea anchors (48 8D 83 + known hook RVA disp) anywhere; DLL base =
+//                 hit - site offset, confirmed by 5-site cross-verification (>=4/5).
+// v6 (after round 5, 15:57): scan passes are SCAN-AND-PATCH - every old-RVA lea is rewritten on
+// sight, every (GameAssemblyBase+oldRVA) qword cache is rewritten too. Plus PHASE 0: before the
+// game even starts, the staged DLL image(s) inside ControlProc are patched, so the injected copy
+// is born with new RVAs (round 5 proved the in-game resolver caches RVAs faster than we can win).
 // A logfile is ALWAYS written (patcher_run_<timestamp>.log next to the exe) unless --no-logfile,
 // so a failed run leaves evidence instead of a vanished console window.
 //
 // Build: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /out:RvaPatcher.exe RvaPatcher.cs
-// Usage (admin):  RvaPatcher.exe                      -> wait for Maplestory_Classic.exe, patch, watch 20s
-//                 RvaPatcher.exe MapleStory --duration 30
+// Usage (admin):  RvaPatcher.exe                      -> phase0 + wait for Maplestory_Classic.exe, patch, watch 30s
+//                 RvaPatcher.exe MapleStory --duration 40
 //                 RvaPatcher.exe --verify-only        -> report current disp32 values, no writes
-// Workflow: run this FIRST, then start the game/injection via ControlProc as usual.
+// Workflow: run this FIRST (ControlProc must already be running for phase0), then start injection.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -258,13 +261,19 @@ internal static class RvaPatcher
     // The dispatch `lea rax,[rbx+disp32]` code, however, is provably intact & readable at detection
     // time (the DLL's own game-input probe read the baked old RVA 0x1660650 from it at +4.7s).
     //
-    // So we scan for the 3-byte lea opcode prefix 48 8D 83 in a single pass; for each hit we read the
-    // following disp32 and accept it only if it equals one of the 5 known hook RVAs (old or new).
-    // Candidate base = hitAbs - site.Offset, then 5-site cross-verification (>=4 matches) confirms it.
+    // v6 (after the 15:57 round-5 run): the scan is now a SCAN-AND-PATCH pass:
+    //   1) lea hits holding an OLD disp are rewritten in place ON SIGHT (covers every copy of the
+    //      dispatch - template/backup included - wherever it lives);
+    //   2) qword hits holding (GameAssemblyBase + oldRVA) - i.e. already-resolved absolute hook
+    //      pointers cached by the DLL's early resolver pass - are rewritten to (base + newRVA).
+    //      Round 5 proved some hooks cache RVAs BEFORE our lea patch lands (probe still read the
+    //      old RVA 0.8s after the patch; hooks installed 2-new/3-old), so the cache itself must
+    //      be patched between the resolver pass and hook install (~+0.3s .. +1.9s window).
+    // Candidate bases are still collected via 5-site cross-verification for the re-patch loop.
     // Chunk-boundary safe via an 8-byte carry-over tail.
     private static readonly byte[] LeaPrefix = new byte[] { 0x48, 0x8D, 0x83 };
 
-    private static List<long> FindDllBasesContentScan(IntPtr hProc)
+    private static List<long> FindDllBasesContentScan(IntPtr hProc, long gaBase)
     {
         List<long> found = new List<long>();
         const int CHUNK = 0x100000; // 1MB
@@ -333,6 +342,30 @@ internal static class RvaPatcher
                             if (dispToOffsets.TryGetValue(disp, out offsets))
                             {
                                 long hitAbs = winStartAbs + idx;
+                                // v6 PATCH-ON-SIGHT: if this lea still holds an OLD disp, rewrite it
+                                // to the corresponding NEW disp immediately - don't wait for base
+                                // verification. Round 5 showed the resolver may read a copy we never
+                                // verify as a "base"; patching every old-RVA lea in-place covers all
+                                // copies (dispatch, template, backup) wherever they live.
+                                foreach (Site s in Sites)
+                                {
+                                    if (disp == s.OldDisp && s.OldDisp != s.NewDisp)
+                                    {
+                                        byte[] newBytes = BitConverter.GetBytes(s.NewDisp);
+                                        uint op;
+                                        if (VirtualProtectEx(hProc, new IntPtr(hitAbs + 3), new UIntPtr(4), PAGE_EXECUTE_READWRITE, out op))
+                                        {
+                                            IntPtr wr;
+                                            bool wok = WriteProcessMemory(hProc, new IntPtr(hitAbs + 3), newBytes, new IntPtr(4), out wr) && wr.ToInt64() == 4;
+                                            uint tp;
+                                            VirtualProtectEx(hProc, new IntPtr(hitAbs + 3), new UIntPtr(4), op, out tp);
+                                            Log("  content-scan: PATCH-ON-SIGHT " + s.Hook + " lea @ 0x" + hitAbs.ToString("X", CultureInfo.InvariantCulture)
+                                                + ": 0x" + s.OldDisp.ToString("X", CultureInfo.InvariantCulture) + " -> 0x" + s.NewDisp.ToString("X", CultureInfo.InvariantCulture)
+                                                + (wok ? " (written)" : " (WRITE FAILED)"));
+                                        }
+                                        break;
+                                    }
+                                }
                                 foreach (long siteOff in offsets)
                                 {
                                     long candBase = hitAbs - siteOff;
@@ -346,19 +379,49 @@ internal static class RvaPatcher
                                     if (matches >= 4)
                                     {
                                         found.Add(candBase);
-                                        // EARLY RETURN: the DLL caches the dispatch RVA at its probe
-                                        // phase (~1.8s after process start). Every ms spent scanning
-                                        // after a verified hit delays the patch and loses the race.
-                                        // The 15:48 run found the hit at +1.3s but kept scanning to
-                                        // +2.4s, so the patch landed AFTER the probe cached the old
-                                        // RVA -> hooks used old values -> crash. Return immediately.
-                                        Log("  content-scan: verified base found - returning immediately (early-exit)");
-                                        return found;
+                                        // v6: NO early return. Round 5 (15:57) proved the resolver does
+                                        // not always read the copy we patch (probe read old RVA 0.8s
+                                        // after patch; hooks installed 2-new/3-old split). There may be
+                                        // a SECOND dispatch copy (template/backup) that we never saw
+                                        // because v4/v5 returned on first hit. Scan everything, collect
+                                        // every verified base, patch all of them.
+                                        Log("  content-scan: verified base FOUND - continuing scan for more copies");
                                     }
                                 }
                             }
                         }
                         idx = IndexOfAt(window, winLen, LeaPrefix, idx + 1);
+                    }
+                    // v6 qword cache patch: the DLL's resolver caches ABSOLUTE hook pointers
+                    // (GameAssemblyBase + oldRVA) in heap slots before hook install. Round 5's
+                    // 2-new/3-old split means some were cached before our lea patch. Find every
+                    // 8-byte occurrence of (gaBase + oldRVA) and rewrite to (gaBase + newRVA).
+                    if (gaBase != 0)
+                    {
+                        foreach (Site s in Sites)
+                        {
+                            long oldAbs = gaBase + (uint)s.OldDisp;
+                            long newAbs = gaBase + (uint)s.NewDisp;
+                            byte[] needle = BitConverter.GetBytes(oldAbs);
+                            int q = IndexOf(window, winLen, needle);
+                            while (q >= 0)
+                            {
+                                long qAbs = winStartAbs + q;
+                                byte[] newBytes = BitConverter.GetBytes(newAbs);
+                                uint op2;
+                                if (VirtualProtectEx(hProc, new IntPtr(qAbs), new UIntPtr(8), PAGE_EXECUTE_READWRITE, out op2))
+                                {
+                                    IntPtr wr2;
+                                    bool wok2 = WriteProcessMemory(hProc, new IntPtr(qAbs), newBytes, new IntPtr(8), out wr2) && wr2.ToInt64() == 8;
+                                    uint tp2;
+                                    VirtualProtectEx(hProc, new IntPtr(qAbs), new UIntPtr(8), op2, out tp2);
+                                    Log("  content-scan: PATCH qword cache " + s.Hook + " @ 0x" + qAbs.ToString("X", CultureInfo.InvariantCulture)
+                                        + ": 0x" + oldAbs.ToString("X", CultureInfo.InvariantCulture) + " -> 0x" + newAbs.ToString("X", CultureInfo.InvariantCulture)
+                                        + (wok2 ? " (written)" : " (WRITE FAILED)"));
+                                }
+                                q = IndexOfAt(window, winLen, needle, q + 1);
+                            }
+                        }
                     }
                     int tailLen = Math.Min(OVERLAP, want);
                     Array.Copy(chunk, want - tailLen, tail, OVERLAP - tailLen, tailLen);
@@ -455,6 +518,26 @@ internal static class RvaPatcher
         return ok ? 1 : -1;
     }
 
+    // Phase 0 (v6): patch the STAGED copy of the injected DLL inside every ControlProc process,
+    // BEFORE injection happens. Round 5 (15:57) proved the DLL's resolver caches hook RVAs within
+    // ~1s of the game process starting - earlier than any external scan can reliably win. But the
+    // DLL image is staged inside ControlProc first (manual-mapping loader), so rewriting the staged
+    // dispatch there means the injected copy is BORN with the new RVAs. gaBase=0 -> qword pass skipped.
+    private static void PatchStagedImages()
+    {
+        Process[] cps = Process.GetProcessesByName("ControlProc");
+        if (cps.Length == 0) { Log("phase0: no ControlProc process found (start it before injecting)"); return; }
+        foreach (Process cp in cps)
+        {
+            IntPtr h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, cp.Id);
+            if (h == IntPtr.Zero) { Log("phase0: OpenProcess(ControlProc pid=" + cp.Id + ") failed (admin?)"); continue; }
+            Log("phase0: scan-and-patch staged DLL in ControlProc pid=" + cp.Id + " ...");
+            List<long> staged = FindDllBasesContentScan(h, 0);
+            Log("phase0: ControlProc pid=" + cp.Id + " -> " + staged.Count + " verified staged image(s) found & lea-patched");
+            CloseHandle(h);
+        }
+    }
+
     public static int Main(string[] args)
     {
         // persistent logfile so the patch trail survives console close.
@@ -462,7 +545,7 @@ internal static class RvaPatcher
         string logfile = null;
         System.IO.StreamWriter logWriter = null;
         string procName = "Maplestory_Classic";
-        int durationSec = 20, intervalMs = 20, waitSec = 180;
+        int durationSec = 30, intervalMs = 20, waitSec = 180;
         bool verifyOnly = false;
         bool noLogfile = false;
         List<string> positional = new List<string>();
@@ -504,6 +587,14 @@ internal static class RvaPatcher
         }
 
         Log("target=" + procName + " duration=" + durationSec + "s interval=" + intervalMs + "ms wait=" + waitSec + "s verifyOnly=" + verifyOnly);
+
+        // PHASE 0: patch staged DLL images inside ControlProc BEFORE injection.
+        // This is the decisive fix from round 5: the DLL's resolver caches RVAs within ~1s of the
+        // game process starting (faster than we can win in-game), but the image is staged inside
+        // ControlProc first - patch it there and the injected copy is born with new RVAs.
+        if (!verifyOnly) PatchStagedImages();
+        else Log("phase0: skipped (verify-only)");
+
         Log("waiting for process (start the game via ControlProc now)...");
         int pid = -1;
         DateTime waitDeadline = DateTime.Now.AddSeconds(waitSec);
@@ -533,38 +624,39 @@ internal static class RvaPatcher
         List<long> bases = new List<long>();
         DateTime procSeenAt = DateTime.Now;      // when the game process first appeared
         DateTime lastContentScan = DateTime.MinValue;
+        long gaBaseEarly = 0;
         while (DateTime.Now < waitDeadline && bases.Count == 0)
         {
             // tier A: fast region-base signature check (cheap, every poll).
-            // NOTE: after the 15:04 field run this path is expected to MISS on the live image
-            // (mapper wipes the hash block); kept because it costs ~0 and covers benign mappers.
             bases = FindDllBases(hProc, checkedRegions);
             if (bases.Count > 0) { Log("detection: fast path (region-base signature) hit"); break; }
 
-            // tier B: lea-anchor content scan. Timing is critical: the DLL caches the dispatch RVA
-            // at its probe phase, measured at ~1.8s after the process appears (15:48 run: probe read
-            // old RVA at +1.80s). The DLL is mapped almost immediately (enter logged at +0.12s), so
-            // start scanning at +0.5s and rescan every 1.5s. With early-exit on verified hit, the
-            // patch can land at ~+0.8s, ahead of the probe.
+            // tier B (v6): scan-AND-patch content pass. Starts +0.3s after the process appears
+            // (round 5: resolver caches RVAs from ~+0.3s), repeats every 0.4s. Each pass rewrites
+            // every old-RVA lea and every (gaBase+oldRVA) qword cache it finds, anywhere in private
+            // memory, and collects verified bases for the targeted re-patch loop.
+            if (gaBaseEarly == 0) gaBaseEarly = GetModuleBase(pid, "GameAssembly.dll");
             double aliveSec = (DateTime.Now - procSeenAt).TotalSeconds;
-            if (aliveSec >= 0.5 && (DateTime.Now - lastContentScan).TotalSeconds >= 0.5)
+            if (aliveSec >= 0.3 && (DateTime.Now - lastContentScan).TotalSeconds >= 0.4)
             {
                 lastContentScan = DateTime.Now;
-                Log("detection: fast path empty after " + aliveSec.ToString("F1") + "s - running lea-anchor content scan (tier B)...");
-                bases = FindDllBasesContentScan(hProc);
-                if (bases.Count > 0) { Log("detection: content scan hit"); break; }
+                List<long> scanFound = FindDllBasesContentScan(hProc, gaBaseEarly);
+                foreach (long b in scanFound) if (!bases.Contains(b)) bases.Add(b);
+                if (bases.Count > 0) { Log("detection: content scan hit (" + bases.Count + " base(s))"); break; }
             }
-            Thread.Sleep(100);
+            Thread.Sleep(50);
         }
         if (bases.Count == 0)
         {
-            Log("ERROR: injected DLL signature not found within wait window.");
-            Log("running one final full content scan before giving up...");
-            bases = FindDllBasesContentScan(hProc);
+            Log("ERROR: injected DLL not found within wait window.");
+            Log("running one final scan-and-patch pass before giving up...");
+            if (gaBaseEarly == 0) gaBaseEarly = GetModuleBase(pid, "GameAssembly.dll");
+            List<long> finalFound = FindDllBasesContentScan(hProc, gaBaseEarly);
+            foreach (long b in finalFound) if (!bases.Contains(b)) bases.Add(b);
         }
         if (bases.Count == 0)
         {
-            Log("ERROR: still not found after final content scan. The DLL was likely never injected");
+            Log("ERROR: still not found after final scan. The DLL was likely never injected");
             Log("       (ControlProc injection not started / failed), OR it lives in non-private memory.");
             DumpPrivateAllocs(hProc, 12);
             CloseHandle(hProc);
@@ -600,6 +692,8 @@ internal static class RvaPatcher
         DateTime deadline = DateTime.Now.AddSeconds(durationSec);
         int pass = 0;
         int patchCount = 0;
+        DateTime lastFullScan = DateTime.Now;
+        DateTime lastStagedRepatch = DateTime.Now;
         while (DateTime.Now < deadline)
         {
             pass++;
@@ -661,6 +755,22 @@ internal static class RvaPatcher
                 }
             }
             if (verifyOnly) break;
+
+            // v6: periodic full scan-and-patch (every ~1.5s) to catch qword caches the resolver
+            // creates between passes and any lea the DLL restores from a template. This is the
+            // safety net behind phase-0 staged patching.
+            if ((DateTime.Now - lastFullScan).TotalSeconds >= 1.5)
+            {
+                lastFullScan = DateTime.Now;
+                List<long> sf = FindDllBasesContentScan(hProc, gaBase);
+                foreach (long b in sf) if (!bases.Contains(b)) { bases.Add(b); Log("  late-discovered base 0x" + b.ToString("X", CultureInfo.InvariantCulture)); }
+            }
+            // v6: periodically re-patch ControlProc staged images (in case of re-stage / multi-slot)
+            if ((DateTime.Now - lastStagedRepatch).TotalSeconds >= 5.0)
+            {
+                lastStagedRepatch = DateTime.Now;
+                PatchStagedImages();
+            }
             Thread.Sleep(intervalMs);
         }
         Log("done. passes=" + pass + " patchesApplied=" + patchCount);
