@@ -598,11 +598,22 @@ internal static class RvaPatcher
         Log("waiting for process (start the game via ControlProc now)...");
         int pid = -1;
         DateTime waitDeadline = DateTime.Now.AddSeconds(waitSec);
+        DateTime lastWaitPhase0 = DateTime.Now;
         while (DateTime.Now < waitDeadline)
         {
             pid = FindProcess(procName);
             if (pid > 0) break;
-            Thread.Sleep(500);
+            // v6.1 (round-6 fix): the user may (re)start ControlProc AFTER we launched - round 6
+            // lost the race because a fresh ControlProc (new staged image, old RVAs) appeared
+            // during this wait and injected before our next phase0 pass. Keep phase0 running
+            // every 1s for the whole wait window so ANY ControlProc instance is patched before
+            // it gets the chance to inject.
+            if (!verifyOnly && (DateTime.Now - lastWaitPhase0).TotalSeconds >= 1.0)
+            {
+                lastWaitPhase0 = DateTime.Now;
+                PatchStagedImages();
+            }
+            Thread.Sleep(200);
         }
         if (pid < 0)
         {
