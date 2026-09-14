@@ -135,9 +135,8 @@ static DWORD WINAPI worker(LPVOID param) {
             void *klass = api_image_get_class(image, c);
             if (!klass) continue;
             totalClasses++;
-            const char *cname = "?", *cns = "?";
-            __try { cname = api_class_get_name(klass); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-            __try { cns = api_class_get_namespace(klass); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            const char *cname = api_class_get_name(klass);
+            const char *cns = api_class_get_namespace(klass);
 
             void *iter = NULL;
             void *m;
@@ -149,10 +148,8 @@ static DWORD WINAPI worker(LPVOID param) {
                     if (!g_targets[t].found &&
                         fp == (void *)((BYTE *)ga + g_targets[t].rva)) {
                         g_targets[t].found = 1;
-                        const char *mname = "?";
-                        int nargs = -1;
-                        __try { mname = api_method_get_name(m); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-                        __try { nargs = api_method_get_param_count(m); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        const char *mname = api_method_get_name(m);
+                        int nargs = api_method_get_param_count(m);
                         logf("HIT[%s] rva=0x%llX class[%zu]=%s.%s method[%zu]=%s params=%d ptr=%p",
                              g_targets[t].tag, g_targets[t].rva, c, cns, cname, mi, mname, nargs, fp);
                     }
