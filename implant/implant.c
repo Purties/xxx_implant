@@ -123,6 +123,40 @@ static struct ident g_idents[] = {
 };
 #define NIDENTS (sizeof(g_idents)/sizeof(g_idents[0]))
 
+/* ---- 特征签名解析层（跨构建稳定：结构字段偏移 + 操作码骨架，掩码轮换字段） ----
+ * 与身份键（哈希名，逐构建轮换）互补：哈希轮换但字段偏移/骨架不变。
+ * sig 掩码：0x00-0xFF 精确字节，'?' 通配（RIP disp32 / 混淆 imm8 等逐构建轮换处）。
+ */
+struct sig { const char *tag; const char *mask; int len; DWORD64 expectRva; int hits; void *firstPtr; };
+static struct sig g_sigs[] = {
+    /* V SetVelocity: 48 89 91 F8 00 00 00 | 0F B6 05 [disp32]  (mov [rcx+0F8],rdx; movzx eax,[rip+?]) */
+    { "V", "48 89 91 F8 00 00 00 0F B6 05 ? ? ? ?", 14, 0x11BE640, 0, NULL },
+};
+#define NSIGS (sizeof(g_sigs)/sizeof(g_sigs[0]))
+
+static int parse_hex_mask(const char *mask, BYTE *out, int maxn) {
+    int n = 0; const char *p = mask;
+    while (*p && n < maxn) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (p[0] == '?') { out[n++] = 0; p += 1; }
+        else { unsigned v; sscanf(p, "%2x", &v); out[n++] = (BYTE)v; p += 2; }
+    }
+    return n;
+}
+static int mask_match(const BYTE *data, const char *mask) {
+    int i = 0; const char *p = mask;
+    for (; *p; ) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (p[0] == '?') { i++; p += 1; continue; }
+        unsigned v; sscanf(p, "%2x", &v);
+        if (data[i] != (BYTE)v) return 0;
+        i++; p += 2;
+    }
+    return 1;
+}
+
 /* MethodInfo 首字段即 methodPointer（Unity il2cpp 布局） */
 static void *method_pointer(void *method) { return *(void **)method; }
 
@@ -281,6 +315,15 @@ static DWORD WINAPI worker(LPVOID param) {
                              c, cns, cname, mi, mname, nargs, fp);
                     }
                 }
+                /* 特征签名解析：掩码匹配方法序言（跨构建稳定结构特征） */
+                if (fp && (BYTE *)fp >= (BYTE *)ga && (BYTE *)fp < gaEnd) {
+                    for (size_t s = 0; s < NSIGS; s++) {
+                        if (mask_match((BYTE *)fp, g_sigs[s].mask)) {
+                            g_sigs[s].hits++;
+                            if (!g_sigs[s].firstPtr) g_sigs[s].firstPtr = fp;
+                        }
+                    }
+                }
                 /* 身份键解析：按类哈希+方法哈希定位 */
                 if (anyCls) {
                     for (size_t k = 0; k < NIDENTS; k++) {
@@ -325,6 +368,15 @@ after_enum:
              g_idents[k].rva, expect, match ? "MATCH" : "MISMATCH");
     }
     logf_("IDENT-VERDICT: %d/%d", ok, (int)NIDENTS);
+
+    /* 6b) 特征签名判定：唯一命中且 == base+expectRva 才算通过 */
+    for (size_t s = 0; s < NSIGS; s++) {
+        void *expect = (BYTE *)ga + g_sigs[s].expectRva;
+        int uniq = (g_sigs[s].hits == 1 && g_sigs[s].firstPtr == expect);
+        logf_("SIG[%s] hits=%d first=%p expect=%p -> %s",
+             g_sigs[s].tag, g_sigs[s].hits, g_sigs[s].firstPtr, expect,
+             uniq ? "UNIQUE-MATCH" : (g_sigs[s].hits == 0 ? "NO-HIT" : "AMBIGUOUS"));
+    }
 
     /* 7) 端到端功能自测（默认关闭！会改写游戏活代码，仅在隔离/离线验证时开启）
      *    开启方式：环境变量 IMPLANT_HOOKTEST=1 */
