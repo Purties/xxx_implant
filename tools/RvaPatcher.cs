@@ -148,8 +148,10 @@ internal static class RvaPatcher
         return true;
     }
 
-    // enumerate candidate DLL bases: MEM_PRIVATE committed regions sized like the image (~8-16MB)
-    private static List<long> FindDllBases(IntPtr hProc, HashSet<long> alreadyChecked)
+    // enumerate candidate DLL bases: MEM_PRIVATE committed regions sized like the image (~8-16MB).
+    // alreadyChecked only caches CONFIRMED hits; unconfirmed regions are re-tested every poll
+    // (the DLL image may be mapped before its data/signature is fully copied in).
+    private static List<long> FindDllBases(IntPtr hProc, HashSet<long> confirmed)
     {
         List<long> found = new List<long>();
         long addr = 0;
@@ -162,12 +164,13 @@ internal static class RvaPatcher
             if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE
                 && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
                 && regionSize >= 0x800000 && regionSize <= 0x1800000
-                && regionBase == mbi.AllocationBase.ToInt64()      // region start == image base
-                && !alreadyChecked.Contains(regionBase))
+                && regionBase == mbi.AllocationBase.ToInt64())     // region start == image base
             {
-                if (RegionHasSignature(hProc, regionBase))
-                    found.Add(regionBase);
-                alreadyChecked.Add(regionBase);
+                if (confirmed.Contains(regionBase) || RegionHasSignature(hProc, regionBase))
+                {
+                    if (!found.Contains(regionBase)) found.Add(regionBase);
+                    confirmed.Add(regionBase);
+                }
             }
             long next = regionBase + regionSize;
             if (next <= addr) break;
