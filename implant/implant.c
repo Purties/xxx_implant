@@ -469,6 +469,8 @@ after_enum:
  * 注：longjmp 会放弃 g_dump 的 stdio 缓冲（置 NULL 防后续 fprintf 用坏状态） */
 static LONG WINAPI veh(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == 0x40010006 /*DBG_PRINTEXCEPTION_C*/ || code == 0x406D1388 /*SetThreadName*/)
+        return EXCEPTION_CONTINUE_SEARCH;   /* 游戏调试输出，忽略 */
     if (g_inDanger && (code == EXCEPTION_ACCESS_VIOLATION ||
                        code == EXCEPTION_ILLEGAL_INSTRUCTION ||
                        code == EXCEPTION_IN_PAGE_ERROR)) {
