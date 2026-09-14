@@ -125,7 +125,7 @@ internal static class RvaPatcher
         return result;
     }
 
-    private static void Log(string msg) { Console.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, msg); }
+    private static Action<string> Log = s => Console.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s);
 
     private static int FindProcess(string name)
     {
@@ -148,9 +148,10 @@ internal static class RvaPatcher
         return true;
     }
 
-    // enumerate candidate DLL bases: MEM_PRIVATE committed regions sized like the image (~8-16MB).
-    // alreadyChecked only caches CONFIRMED hits; unconfirmed regions are re-tested every poll
-    // (the DLL image may be mapped before its data/signature is fully copied in).
+    // enumerate candidate DLL bases: MEM_PRIVATE committed regions.
+    // Manual-mapped image may be one big allocation (RXW whole) OR split by protection layout with a
+    // small first region (< 8MB), so size filter is deliberately wide (1MB..16MB); the embedded
+    // SHA-256 signature confirms with near-zero false positives.
     private static List<long> FindDllBases(IntPtr hProc, HashSet<long> confirmed)
     {
         List<long> found = new List<long>();
@@ -163,7 +164,7 @@ internal static class RvaPatcher
             long regionSize = (long)mbi.RegionSize.ToUInt64();
             if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE
                 && (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
-                && regionSize >= 0x800000 && regionSize <= 0x1800000
+                && regionSize >= 0x100000 && regionSize <= 0x4000000
                 && regionBase == mbi.AllocationBase.ToInt64())     // region start == image base
             {
                 if (confirmed.Contains(regionBase) || RegionHasSignature(hProc, regionBase))
@@ -177,6 +178,33 @@ internal static class RvaPatcher
             addr = next;
         }
         return found;
+    }
+
+    // diagnostic: dump the first few MEM_PRIVATE allocations (base/size/protect) so a missed
+    // detection can be reasoned about instead of guessed.
+    private static void DumpPrivateAllocs(IntPtr hProc, int max)
+    {
+        Log("  -- first private allocations (diag) --");
+        int shown = 0;
+        long addr = 0;
+        MEMORY_BASIC_INFORMATION mbi;
+        int mbiSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
+        while (VirtualQueryEx(hProc, new IntPtr(addr), out mbi, new IntPtr(mbiSize)) != IntPtr.Zero && shown < max)
+        {
+            long regionBase = mbi.BaseAddress.ToInt64();
+            long regionSize = (long)mbi.RegionSize.ToUInt64();
+            if (mbi.State == MEM_COMMIT && mbi.Type == MEM_PRIVATE)
+            {
+                Log("    base=0x" + regionBase.ToString("X", CultureInfo.InvariantCulture)
+                    + " size=0x" + regionSize.ToString("X", CultureInfo.InvariantCulture)
+                    + " protect=0x" + mbi.Protect.ToString("X8", CultureInfo.InvariantCulture));
+                shown++;
+            }
+            long next = regionBase + regionSize;
+            if (next <= addr) break;
+            addr = next;
+        }
+        if (shown == 0) Log("    (no private committed regions)");
     }
 
     private static bool ReadSite(IntPtr hProc, long dllBase, Site s, out int curDisp)
@@ -201,6 +229,14 @@ internal static class RvaPatcher
             return false;
         IntPtr written;
         bool ok = WriteProcessMemory(hProc, new IntPtr(addr), bytes, new IntPtr(4), out written) && written.ToInt64() == 4;
+        if (ok)
+        {
+            // read-back verification
+            byte[] chk = new byte[4];
+            IntPtr r;
+            ok = ReadProcessMemory(hProc, new IntPtr(addr), chk, new IntPtr(4), out r) && r.ToInt64() == 4
+                 && BitConverter.ToInt32(chk, 0) == s.NewDisp;
+        }
         uint tmp;
         VirtualProtectEx(hProc, new IntPtr(dllBase + s.Offset), new UIntPtr(7), oldProt, out tmp);
         return ok;
@@ -240,6 +276,9 @@ internal static class RvaPatcher
 
     public static int Main(string[] args)
     {
+        // persistent logfile so the patch trail survives console close
+        string logfile = null;
+        System.IO.StreamWriter logWriter = null;
         string procName = "Maplestory_Classic";
         int durationSec = 15, intervalMs = 20, waitSec = 180;
         bool verifyOnly = false;
@@ -249,10 +288,18 @@ internal static class RvaPatcher
             if (args[i] == "--duration" && i + 1 < args.Length) durationSec = int.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (args[i] == "--interval" && i + 1 < args.Length) intervalMs = int.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (args[i] == "--wait" && i + 1 < args.Length) waitSec = int.Parse(args[++i], CultureInfo.InvariantCulture);
+            else if (args[i] == "--logfile" && i + 1 < args.Length) logfile = args[++i];
             else if (args[i] == "--verify-only") verifyOnly = true;
             else if (!args[i].StartsWith("--")) positional.Add(args[i]);
         }
         if (positional.Count > 0) procName = positional[0];
+        if (logfile != null)
+        {
+            logWriter = new System.IO.StreamWriter(logfile, true, Encoding.UTF8);
+            logWriter.AutoFlush = true;
+            Log = s => { Console.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s); logWriter.WriteLine("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, s); };
+            Log("==== RvaPatcher session start ====");
+        }
 
         Log("target=" + procName + " duration=" + durationSec + "s interval=" + intervalMs + "ms wait=" + waitSec + "s verifyOnly=" + verifyOnly);
         Log("waiting for process (start the game via ControlProc now)...");
@@ -264,11 +311,21 @@ internal static class RvaPatcher
             if (pid > 0) break;
             Thread.Sleep(500);
         }
-        if (pid < 0) { Log("ERROR: process never appeared."); return 2; }
+        if (pid < 0)
+        {
+            Log("ERROR: process never appeared.");
+            if (logWriter != null) logWriter.Close();
+            return 2;
+        }
         Log("process pid=" + pid + " - watching for injected DLL...");
 
         IntPtr hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, pid);
-        if (hProc == IntPtr.Zero) { Log("ERROR: OpenProcess failed (run as administrator)."); return 3; }
+        if (hProc == IntPtr.Zero)
+        {
+            Log("ERROR: OpenProcess failed (run as administrator).");
+            if (logWriter != null) logWriter.Close();
+            return 3;
+        }
 
         HashSet<long> checkedRegions = new HashSet<long>();
         List<long> bases = new List<long>();
@@ -277,8 +334,35 @@ internal static class RvaPatcher
             bases = FindDllBases(hProc, checkedRegions);
             if (bases.Count == 0) Thread.Sleep(100);
         }
-        if (bases.Count == 0) { Log("ERROR: injected DLL signature not found within wait window."); CloseHandle(hProc); return 4; }
-        foreach (long b in bases) Log("DLL image base: 0x" + b.ToString("X", CultureInfo.InvariantCulture));
+        if (bases.Count == 0)
+        {
+            Log("ERROR: injected DLL signature not found within wait window.");
+            DumpPrivateAllocs(hProc, 12);
+            CloseHandle(hProc);
+            if (logWriter != null) logWriter.Close();
+            return 4;
+        }
+        foreach (long b in bases)
+        {
+            byte[] mz = new byte[2];
+            IntPtr mzRead;
+            long sizeOfImage = 0;
+            if (ReadProcessMemory(hProc, new IntPtr(b), mz, new IntPtr(2), out mzRead) && mzRead.ToInt64() == 2 && mz[0] == (byte)'M' && mz[1] == (byte)'Z')
+            {
+                byte[] e_lfanew = new byte[4];
+                IntPtr r2;
+                if (ReadProcessMemory(hProc, new IntPtr(b + 0x3C), e_lfanew, new IntPtr(4), out r2) && r2.ToInt64() == 4)
+                {
+                    uint peOff = BitConverter.ToUInt32(e_lfanew, 0);
+                    byte[] opt = new byte[8];
+                    IntPtr r3;
+                    if (ReadProcessMemory(hProc, new IntPtr(b + peOff + 0x18 + 0x38), opt, new IntPtr(8), out r3) && r3.ToInt64() == 8)
+                        sizeOfImage = BitConverter.ToUInt32(opt, 0);
+                }
+            }
+            Log("DLL image base: 0x" + b.ToString("X", CultureInfo.InvariantCulture)
+                + (mzRead.ToInt64() == 2 && mz[0] == (byte)'M' ? " (MZ ok, SizeOfImage=0x" + sizeOfImage.ToString("X", CultureInfo.InvariantCulture) + ")" : " (NO-MZ! suspicious)"));
+        }
 
         long gaBase = GetModuleBase(pid, "GameAssembly.dll");
         if (gaBase == 0) Log("WARN: GameAssembly.dll module base not found yet (slot path disabled until found)");
@@ -353,6 +437,7 @@ internal static class RvaPatcher
         Log("done. passes=" + pass + " patchesApplied=" + patchCount);
         Log("verify in game dir hook_artifacts\\diagnostics: invincible-hook.log targets should be base+0x12144F0/+0x1214940/+0x1215270/+0x10D74B0; imgui-startup.log Update should install (rva=0x14DB0B0), no crash.");
         CloseHandle(hProc);
+        if (logWriter != null) logWriter.Close();
         return 0;
     }
 }
