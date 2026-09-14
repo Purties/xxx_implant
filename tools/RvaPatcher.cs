@@ -230,19 +230,59 @@ internal static class RvaPatcher
         return -1;
     }
 
+    // Cross-verify a candidate DLL base: read all 5 dispatch lea sites at candBase+site.Offset,
+    // count how many hold the expected opcode (48 8D 83) with disp == OldDisp or NewDisp.
+    // A genuine mapped image passes 5/5 (or 4/5 if one site is mid-rewrite); a stray heap copy
+    // of a fragment fails because the 5 sites won't line up at the correct relative offsets.
+    private static int VerifyBase(IntPtr hProc, long candBase)
+    {
+        int ok = 0;
+        foreach (Site s in Sites)
+        {
+            byte[] buf = new byte[7];
+            IntPtr rd;
+            if (!ReadProcessMemory(hProc, new IntPtr(candBase + s.Offset), buf, new IntPtr(7), out rd) || rd.ToInt64() != 7)
+                continue;
+            if (buf[0] != 0x48 || buf[1] != 0x8D || buf[2] != 0x83) continue;
+            int disp = BitConverter.ToInt32(buf, 3);
+            if (disp == s.OldDisp || disp == s.NewDisp) ok++;
+        }
+        return ok;
+    }
+
     // Fallback detection (tier B): full content scan of every readable MEM_PRIVATE region.
-    // Does NOT assume the DLL image starts at an allocation base or occupies one region:
-    // the signature anchor is searched anywhere; candidate DLL base = hit - SignatureOffset.
-    // Candidates are validated by checking the first dispatch lea bytes at base+0x127CDB.
-    // Chunk-boundary safe: the last (sigLen-1) bytes of each chunk are carried over.
+    //
+    // Anchor choice (r4, after the 2026-09-14 15:04 field run): the version-table SHA-256 block is
+    // NOT a reliable anchor - the live image's hash region is wiped/hidden by the manual mapper and
+    // only a stray, non-aligned heap copy survives (base derived from it failed the lea check).
+    // The dispatch `lea rax,[rbx+disp32]` code, however, is provably intact & readable at detection
+    // time (the DLL's own game-input probe read the baked old RVA 0x1660650 from it at +4.7s).
+    //
+    // So we scan for the 3-byte lea opcode prefix 48 8D 83 in a single pass; for each hit we read the
+    // following disp32 and accept it only if it equals one of the 5 known hook RVAs (old or new).
+    // Candidate base = hitAbs - site.Offset, then 5-site cross-verification (>=4 matches) confirms it.
+    // Chunk-boundary safe via an 8-byte carry-over tail.
+    private static readonly byte[] LeaPrefix = new byte[] { 0x48, 0x8D, 0x83 };
+
     private static List<long> FindDllBasesContentScan(IntPtr hProc)
     {
         List<long> found = new List<long>();
         const int CHUNK = 0x100000; // 1MB
-        int overlap = Signature.Length - 1;
+        const int OVERLAP = 8;      // >= 7 (full lea) so boundary-spanning leas are not missed
         byte[] chunk = new byte[CHUNK];
-        byte[] tail = new byte[overlap];
-        byte[] window = new byte[CHUNK + overlap];
+        byte[] tail = new byte[OVERLAP];
+        byte[] window = new byte[CHUNK + OVERLAP];
+
+        // map disp value -> site offsets that use it (old & new variants)
+        var dispToOffsets = new Dictionary<int, List<long>>();
+        foreach (Site s in Sites)
+        {
+            if (!dispToOffsets.ContainsKey(s.OldDisp)) dispToOffsets[s.OldDisp] = new List<long>();
+            dispToOffsets[s.OldDisp].Add(s.Offset);
+            if (!dispToOffsets.ContainsKey(s.NewDisp)) dispToOffsets[s.NewDisp] = new List<long>();
+            dispToOffsets[s.NewDisp].Add(s.Offset);
+        }
+
         long addr = 0;
         MEMORY_BASIC_INFORMATION mbi;
         int mbiSize = Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION));
@@ -267,15 +307,14 @@ internal static class RvaPatcher
                         continue;
                     }
                     scanned += want;
-                    // assemble search window: [tail][chunk]
                     int winLen;
-                    long winStartAbs; // absolute address of window[0]
+                    long winStartAbs;
                     if (haveTail)
                     {
-                        Array.Copy(tail, 0, window, 0, overlap);
-                        Array.Copy(chunk, 0, window, overlap, want);
-                        winLen = overlap + want;
-                        winStartAbs = regionBase + pos - overlap;
+                        Array.Copy(tail, 0, window, 0, OVERLAP);
+                        Array.Copy(chunk, 0, window, OVERLAP, want);
+                        winLen = OVERLAP + want;
+                        winStartAbs = regionBase + pos - OVERLAP;
                     }
                     else
                     {
@@ -283,29 +322,36 @@ internal static class RvaPatcher
                         winLen = want;
                         winStartAbs = regionBase + pos;
                     }
-                    int idx = IndexOf(window, winLen, Signature);
+                    int idx = IndexOf(window, winLen, LeaPrefix);
                     while (idx >= 0)
                     {
-                        long hitAbs = winStartAbs + idx;
-                        long candBase = hitAbs - SignatureOffset;
-                        if (!found.Contains(candBase))
+                        // need 7 bytes (3 opcode + 4 disp) from idx
+                        if (idx + 7 <= winLen)
                         {
-                            // validate: first dispatch lea bytes at candBase+0x127CDB
-                            byte[] lea = new byte[3];
-                            IntPtr lr;
-                            bool valid = ReadProcessMemory(hProc, new IntPtr(candBase + 0x127CDB), lea, new IntPtr(3), out lr)
-                                         && lr.ToInt64() == 3 && lea[0] == 0x48 && lea[1] == 0x8D && lea[2] == 0x83;
-                            Log("  content-scan: signature hit at 0x" + hitAbs.ToString("X", CultureInfo.InvariantCulture)
-                                + " -> candidate DLL base 0x" + candBase.ToString("X", CultureInfo.InvariantCulture)
-                                + (valid ? " (lea check OK)" : " (lea check FAILED - stray copy?)"));
-                            if (valid) found.Add(candBase);
+                            int disp = BitConverter.ToInt32(window, idx + 3);
+                            List<long> offsets;
+                            if (dispToOffsets.TryGetValue(disp, out offsets))
+                            {
+                                long hitAbs = winStartAbs + idx;
+                                foreach (long siteOff in offsets)
+                                {
+                                    long candBase = hitAbs - siteOff;
+                                    if (found.Contains(candBase)) continue;
+                                    int matches = VerifyBase(hProc, candBase);
+                                    Log("  content-scan: lea hit at 0x" + hitAbs.ToString("X", CultureInfo.InvariantCulture)
+                                        + " disp=0x" + disp.ToString("X", CultureInfo.InvariantCulture)
+                                        + " -> candidate base 0x" + candBase.ToString("X", CultureInfo.InvariantCulture)
+                                        + " cross-verify " + matches + "/5"
+                                        + (matches >= 4 ? " (ACCEPTED)" : " (rejected - stray fragment)"));
+                                    if (matches >= 4) found.Add(candBase);
+                                }
+                            }
                         }
-                        idx = IndexOfAt(window, winLen, Signature, idx + 1);
+                        idx = IndexOfAt(window, winLen, LeaPrefix, idx + 1);
                     }
-                    // carry over the last `overlap` bytes of this chunk
-                    int tailLen = Math.Min(overlap, want);
-                    Array.Copy(chunk, want - tailLen, tail, overlap - tailLen, tailLen);
-                    if (tailLen < overlap) Array.Clear(tail, 0, overlap - tailLen);
+                    int tailLen = Math.Min(OVERLAP, want);
+                    Array.Copy(chunk, want - tailLen, tail, OVERLAP - tailLen, tailLen);
+                    if (tailLen < OVERLAP) Array.Clear(tail, 0, OVERLAP - tailLen);
                     haveTail = true;
                     pos += want;
                 }
@@ -478,19 +524,22 @@ internal static class RvaPatcher
         DateTime lastContentScan = DateTime.MinValue;
         while (DateTime.Now < waitDeadline && bases.Count == 0)
         {
-            // tier A: fast region-base signature check (cheap, every poll)
+            // tier A: fast region-base signature check (cheap, every poll).
+            // NOTE: after the 15:04 field run this path is expected to MISS on the live image
+            // (mapper wipes the hash block); kept because it costs ~0 and covers benign mappers.
             bases = FindDllBases(hProc, checkedRegions);
             if (bases.Count > 0) { Log("detection: fast path (region-base signature) hit"); break; }
 
-            // tier B: full content scan fallback. Triggered once the process has been alive long
-            // enough for the injection to have landed (~3s: hooks install at ~2.7s), then retried
-            // every 3s. This catches images mapped at an offset inside a larger allocation or with
-            // per-section protection, which the fast path's regionBase==AllocationBase test misses.
+            // tier B: lea-anchor content scan. Timing is critical: the 15:04 run measured the
+            // window "process appears -> DLL reads dispatch" at only ~4.7s (probe at +4.74s,
+            // hooks install at +5.0s). So start scanning 1s after the process appears (the DLL is
+            // mapped by then - its enter phase logged +0.1s after process creation) and rescan
+            // every 1.5s. Each full pass takes ~1.2s over ~560MB of private memory.
             double aliveSec = (DateTime.Now - procSeenAt).TotalSeconds;
-            if (aliveSec >= 3.0 && (DateTime.Now - lastContentScan).TotalSeconds >= 3.0)
+            if (aliveSec >= 1.0 && (DateTime.Now - lastContentScan).TotalSeconds >= 1.5)
             {
                 lastContentScan = DateTime.Now;
-                Log("detection: fast path empty after " + aliveSec.ToString("F1") + "s - running full content scan (tier B)...");
+                Log("detection: fast path empty after " + aliveSec.ToString("F1") + "s - running lea-anchor content scan (tier B)...");
                 bases = FindDllBasesContentScan(hProc);
                 if (bases.Count > 0) { Log("detection: content scan hit"); break; }
             }
