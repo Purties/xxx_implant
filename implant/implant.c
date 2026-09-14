@@ -127,12 +127,26 @@ static struct ident g_idents[] = {
  * 与身份键（哈希名，逐构建轮换）互补：哈希轮换但字段偏移/骨架不变。
  * sig 掩码：0x00-0xFF 精确字节，'?' 通配（RIP disp32 / 混淆 imm8 等逐构建轮换处）。
  */
-struct sig { const char *tag; const char *mask; int len; DWORD64 expectRva; int hits; void *firstPtr; };
+struct sig { const char *tag; const char *mask; int len; DWORD64 expectRva;
+             const char *sameClassAs;  /* 非空则要求命中方法与该 tag 同属一个类（结构约束消歧） */
+             const char *callsTag;     /* 非空则要求命中方法体内前 256B 有 call 到该 tag 的方法 */
+             int hits; void *firstPtr; void *firstKlass; };
 static struct sig g_sigs[] = {
-    /* V SetVelocity: 48 89 91 F8 00 00 00 | 0F B6 05 [disp32]  (mov [rcx+0F8],rdx; movzx eax,[rip+?]) */
-    { "V", "48 89 91 F8 00 00 00 0F B6 05 ? ? ? ?", 14, 0x11BE640, 0, NULL },
+    /* 5 条签名由 tools/sig_design.py 从老/新两版 GA 逐字节 diff 自动掩码生成，
+     * 两版各自唯一命中期望 RVA（跨构建唯一性已离线证明）。expectRva 为老版基准。
+     * C 序言通用（56B 前缀活体 108 命中），用"与 V 同类 + 体内 call I"结构约束收敛。 */
+    { "V", "48 89 91 F8 00 00 00 0F B6 05 ? ? ? 05 ? ?", 16, 0x11BE640, NULL, NULL, 0, NULL, NULL },
+    { "I", "56 57 53 48 81 EC ? 01 00 00 44 0F 29 84 24 ? 01 00 00 0F 29 BC 24 ? 01 00 00 0F 29 B4 24 ? 01 00 00 66 0F 28 F2 66 0F 28 F9 48 89 CE 48 8D", 48, 0x11BE670, NULL, NULL, 0, NULL, NULL },
+    { "C", "48 83 EC ? 48 8D 05 ? 00 00 00 48 89 44 24 ? 48 8B 44 24 ? 48 89 05 ? ? ? 05 48 8D 05 ? 00 00 00 48 89 44 24 ? 48", 56, 0x11BEF10, "V", "I", 0, NULL, NULL },
+    { "D", "41 57 41 56 41 55 41 54 56 57 55 53 B8 ? 12 00 00 E8 ? ? ? FF 48 29 C4 0F 29 BC 24 ? 12 00", 32, 0x1049B70, NULL, NULL, 0, NULL, NULL },
+    { "U", "E9 0B 00 00 00 66 66 2E 0F 1F 84 00 00 00 00 00 56 57 53 48 81 EC ? ? 00 00 48 89 CE 48 8D 05 ? ? 00 00 48 89 84 24 ? ? 00 00 48 8D 0D ?", 48, 0x1660650, NULL, NULL, 0, NULL, NULL },
 };
 #define NSIGS (sizeof(g_sigs)/sizeof(g_sigs[0]))
+
+static struct sig *sig_by_tag(const char *tag) {
+    for (size_t i = 0; i < NSIGS; i++) if (!strcmp(g_sigs[i].tag, tag)) return &g_sigs[i];
+    return NULL;
+}
 
 static int parse_hex_mask(const char *mask, BYTE *out, int maxn) {
     int n = 0; const char *p = mask;
@@ -318,9 +332,28 @@ static DWORD WINAPI worker(LPVOID param) {
                 /* 特征签名解析：掩码匹配方法序言（跨构建稳定结构特征） */
                 if (fp && (BYTE *)fp >= (BYTE *)ga && (BYTE *)fp < gaEnd) {
                     for (size_t s = 0; s < NSIGS; s++) {
-                        if (mask_match((BYTE *)fp, g_sigs[s].mask)) {
-                            g_sigs[s].hits++;
-                            if (!g_sigs[s].firstPtr) g_sigs[s].firstPtr = fp;
+                        if (!mask_match((BYTE *)fp, g_sigs[s].mask)) continue;
+                        /* 结构约束消歧（§5.7.2/3：V/I/C 同类且 C 体内 call I） */
+                        if (g_sigs[s].sameClassAs) {
+                            struct sig *anchor = sig_by_tag(g_sigs[s].sameClassAs);
+                            if (!anchor || anchor->firstKlass != klass) continue;
+                        }
+                        if (g_sigs[s].callsTag) {
+                            struct sig *callee = sig_by_tag(g_sigs[s].callsTag);
+                            if (!callee || !callee->firstPtr) continue;
+                            int found = 0;
+                            BYTE *fb = (BYTE *)fp;
+                            for (int off = 0; off + 5 <= 256; off++) {
+                                if (fb[off] != 0xE8) continue;
+                                int rel = *(int *)(fb + off + 1);
+                                if (fb + off + 5 + rel == (BYTE *)callee->firstPtr) { found = 1; break; }
+                            }
+                            if (!found) continue;
+                        }
+                        g_sigs[s].hits++;
+                        if (!g_sigs[s].firstPtr) {
+                            g_sigs[s].firstPtr = fp;
+                            g_sigs[s].firstKlass = klass;
                         }
                     }
                 }
