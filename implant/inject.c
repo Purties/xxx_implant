@@ -8,6 +8,8 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
+#include <string.h>
 #include <aclapi.h>
 #include <sddl.h>
 #include <stdio.h>
@@ -59,7 +61,71 @@ static int spawn_inject(const wchar_t *exe, const wchar_t *workdir, const char *
     return ec ? 0 : 6;
 }
 
+/* 竞速注入：轮询目标进程名，出现即抢在反作弊剥离句柄前注入。
+ * 用法 --race <exe-name.exe> <dll> [baselinePid]
+ * 若给 baselinePid，则等待 pid != baseline 的新实例出现（应对已在运行的旧实例）。 */
+static int do_inject(HANDLE hProc, const char *dllA) {
+    size_t len = strlen(dllA) + 1;
+    void *remote = VirtualAllocEx(hProc, NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remote) { wprintf(L"  race: VirtualAllocEx err=%lu (stripped?)\n", GetLastError()); return 0; }
+    if (!WriteProcessMemory(hProc, remote, dllA, len, NULL)) {
+        wprintf(L"  race: WriteProcessMemory err=%lu\n", GetLastError()); return 0;
+    }
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    FARPROC loadLib = GetProcAddress(k32, "LoadLibraryA");
+    HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)loadLib, remote, 0, NULL);
+    if (!hThread) { wprintf(L"  race: CreateRemoteThread err=%lu\n", GetLastError()); return 0; }
+    WaitForSingleObject(hThread, 15000);
+    DWORD ec = 0; GetExitCodeThread(hThread, &ec);
+    CloseHandle(hThread);
+    wprintf(L"  race: LoadLibraryA module=%p (0=failed)\n", (void *)(DWORD64)ec);
+    return ec != 0;
+}
+
+static int race_inject(const wchar_t *exeName, const char *dllA, DWORD baselinePid) {
+    enable_debug_priv();
+    wprintf(L"racing for '%ls' (baseline pid=%lu)... 2min window\n", exeName, baselinePid);
+    DWORD deadline = GetTickCount() + 120000;   /* 2 分钟窗口 */
+    while (GetTickCount() < deadline) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) { Sleep(1); continue; }
+        PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+        BOOL more = Process32FirstW(snap, &pe);
+        while (more) {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0 && pe.th32ProcessID != baselinePid) {
+                DWORD pid = pe.th32ProcessID;
+                CloseHandle(snap); snap = INVALID_HANDLE_VALUE;
+                wprintf(L"  appeared pid=%lu, injecting NOW\n", pid);
+                HANDLE h = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+                if (!h) h = OpenProcess(PROCESS_VM_OPERATION|PROCESS_VM_WRITE|PROCESS_VM_READ|
+                                        PROCESS_CREATE_THREAD|PROCESS_QUERY_INFORMATION, FALSE, pid);
+                if (h) {
+                    int ok = do_inject(h, dllA);
+                    CloseHandle(h);
+                    if (ok) { wprintf(L"  RACE-INJECT SUCCESS pid=%lu\n", pid); return 0; }
+                } else {
+                    wprintf(L"  OpenProcess failed err=%lu (too late? retry)\n", GetLastError());
+                }
+                /* 失败则继续等下一个实例 */
+                break;
+            }
+            more = Process32Next(snap, &pe);
+        }
+        if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+        Sleep(0);   /* 最紧轮询 */
+    }
+    wprintf(L"race window expired, no successful inject\n");
+    return 8;
+}
+
 int wmain(int argc, wchar_t **argv) {
+    /* --race <exe-name> <dll> [baselinePid] */
+    if (argc >= 4 && wcscmp(argv[1], L"--race") == 0) {
+        char dllA[MAX_PATH];
+        WideCharToMultiByte(CP_ACP, 0, argv[3], -1, dllA, MAX_PATH, NULL, NULL);
+        DWORD base = (argc >= 5) ? (DWORD)_wtoi(argv[4]) : 0;
+        return race_inject(argv[2], dllA, base);
+    }
     /* --spawn <exe> <workdir> <dll> : 创建时注入 */
     if (argc >= 5 && wcscmp(argv[1], L"--spawn") == 0) {
         enable_debug_priv();
@@ -68,7 +134,9 @@ int wmain(int argc, wchar_t **argv) {
         return spawn_inject(argv[2], argv[3], dllA);
     }
     if (argc < 3) {
-        wprintf(L"usage: inject.exe <pid> <dll-path>\n        inject.exe --spawn <exe> <workdir> <dll-path>\n");
+        wprintf(L"usage: inject.exe <pid> <dll-path>\n"
+                L"       inject.exe --spawn <exe> <workdir> <dll-path>\n"
+                L"       inject.exe --race <exe-name.exe> <dll-path> [baselinePid]\n");
         return 1;
     }
     DWORD pid = (DWORD)_wtoi(argv[1]);
