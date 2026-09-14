@@ -19,3 +19,8 @@ tools/mingw64/
 
 # xxx 为独立 git 仓库（交接文档与观测产物），外层不跟踪
 xxx/
+
+# implant 运行产物（可再生）
+implant/out/
+implant/*.dll
+implant/*.exe
