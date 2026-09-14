@@ -343,7 +343,18 @@ internal static class RvaPatcher
                                         + " -> candidate base 0x" + candBase.ToString("X", CultureInfo.InvariantCulture)
                                         + " cross-verify " + matches + "/5"
                                         + (matches >= 4 ? " (ACCEPTED)" : " (rejected - stray fragment)"));
-                                    if (matches >= 4) found.Add(candBase);
+                                    if (matches >= 4)
+                                    {
+                                        found.Add(candBase);
+                                        // EARLY RETURN: the DLL caches the dispatch RVA at its probe
+                                        // phase (~1.8s after process start). Every ms spent scanning
+                                        // after a verified hit delays the patch and loses the race.
+                                        // The 15:48 run found the hit at +1.3s but kept scanning to
+                                        // +2.4s, so the patch landed AFTER the probe cached the old
+                                        // RVA -> hooks used old values -> crash. Return immediately.
+                                        Log("  content-scan: verified base found - returning immediately (early-exit)");
+                                        return found;
+                                    }
                                 }
                             }
                         }
@@ -530,13 +541,13 @@ internal static class RvaPatcher
             bases = FindDllBases(hProc, checkedRegions);
             if (bases.Count > 0) { Log("detection: fast path (region-base signature) hit"); break; }
 
-            // tier B: lea-anchor content scan. Timing is critical: the 15:04 run measured the
-            // window "process appears -> DLL reads dispatch" at only ~4.7s (probe at +4.74s,
-            // hooks install at +5.0s). So start scanning 1s after the process appears (the DLL is
-            // mapped by then - its enter phase logged +0.1s after process creation) and rescan
-            // every 1.5s. Each full pass takes ~1.2s over ~560MB of private memory.
+            // tier B: lea-anchor content scan. Timing is critical: the DLL caches the dispatch RVA
+            // at its probe phase, measured at ~1.8s after the process appears (15:48 run: probe read
+            // old RVA at +1.80s). The DLL is mapped almost immediately (enter logged at +0.12s), so
+            // start scanning at +0.5s and rescan every 1.5s. With early-exit on verified hit, the
+            // patch can land at ~+0.8s, ahead of the probe.
             double aliveSec = (DateTime.Now - procSeenAt).TotalSeconds;
-            if (aliveSec >= 1.0 && (DateTime.Now - lastContentScan).TotalSeconds >= 1.5)
+            if (aliveSec >= 0.5 && (DateTime.Now - lastContentScan).TotalSeconds >= 0.5)
             {
                 lastContentScan = DateTime.Now;
                 Log("detection: fast path empty after " + aliveSec.ToString("F1") + "s - running lea-anchor content scan (tier B)...");
