@@ -1,13 +1,18 @@
 # sig_design.py - 离线设计并验证 5 钩特征签名
 # 方法：对每个钩子取老/新 GA 各自 RVA 处 N 字节 -> 逐位 diff 生成掩码 ->
 #       在两份 GA 的 .text 全量扫描掩码命中，要求：期望 RVA 命中且总数可控（唯一）
-import pefile, sys
+import pefile, sys, re
 
-OLD = r"c:\workspace\9-4#2\tools\GameAssembly_old_0902.dll"
-NEW = r"c:\workspace\9-4#2\tools\GameAssembly.dll"
-HOOKS = {"V": (0x11BE640, 0x12144F0), "I": (0x11BE670, 0x1214940),
-         "C": (0x11BEF10, 0x1215270), "D": (0x1049B70, 0x10D74B0),
-         "U": (0x1660650, 0x14DB0B0)}
+# 支持命令行覆盖：sig_design.py [old.dll new.dll oldRVA newRVA [tag]]
+if len(sys.argv) >= 6:
+    OLD, NEW = sys.argv[1], sys.argv[2]
+    HOOKS = {sys.argv[5]: (int(sys.argv[3],16), int(sys.argv[4],16))}
+else:
+    OLD = r"c:\workspace\9-4#2\tools\GameAssembly_old_0902.dll"
+    NEW = r"c:\workspace\9-4#2\tools\GameAssembly.dll"
+    HOOKS = {"V": (0x11BE640, 0x12144F0), "I": (0x11BE670, 0x1214940),
+             "C": (0x11BEF10, 0x1215270), "D": (0x1049B70, 0x10D74B0),
+             "U": (0x1660650, 0x14DB0B0)}
 N = 24
 
 def load(path):

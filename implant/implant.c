@@ -140,15 +140,16 @@ static struct sig g_sigs[] = {
     /* wantParams：D=10（SetDamaged 极独特参数数，用于运行时消歧；-1=不约束） */
     { "V", "48 89 91 F8 00 00 00 0F B6 05 ? ? ? 05 ? ?", 16, 0x11BE640, 0x12144F0, -1, NULL, NULL, 0, NULL, NULL },
     { "I", "56 57 53 48 81 EC ? 01 00 00 44 0F 29 84 24 ? 01 00 00 0F 29 BC 24 ? 01 00 00 0F 29 B4 24 ? 01 00 00 66 0F 28 F2 66 0F 28 F9 48 89 CE 48 8D", 48, 0x11BE670, 0x1214940, -1, NULL, NULL, 0, NULL, NULL },
-    { "C", "48 83 EC ? 48 8D 05 ? 00 00 00 48 89 44 24 ? 48 8B 44 24 ? 48 89 05 ? ? ? 05 48 8D 05 ? 00 00 00 48 89 44 24 ? 48", 56, 0x11BEF10, 0x1215270, -1, "V", "I", 0, NULL, NULL },
+    { "C", "48 83 EC ? 48 8D 05 ? 00 00 00 48 89 44 24", 14, 0x11BEF10, 0x1215270, -1, "V", "I", 0, NULL, NULL },
     { "D", "41 57 41 56 41 55 41 54 56 57 55 53 B8 ? ? ? ? E8 ? ? ? FF 48 29 C4", 26, 0x1049B70, 0x10D74B0, 10, NULL, NULL, 0, NULL, NULL },
     { "U", "E9 0B 00 00 00 66 66 2E 0F 1F 84 00 00 00 00 00 56 57 53 48 81 EC ? ? 00 00 48 89 CE 48 8D 05 ? ? 00 00 48 89 84 24 ? ? 00 00 48 8D 0D ?", 48, 0x1660650, 0x14DB0B0, -1, NULL, NULL, 0, NULL, NULL },
 };
 #define NSIGS (sizeof(g_sigs)/sizeof(g_sigs[0]))
 
-/* 约束型签名：先收集全部掩码命中候选，枚举结束后再解约束（不依赖方法遍历顺序） */
+/* 约束型签名：先收集全部掩码命中候选，枚举结束后再解约束（不依赖方法遍历顺序）
+ * C 用松掩码（~1800 命中），故缓冲上限需覆盖之；D 用 wantParams 即时过滤不缓冲。 */
 struct sig;
-#define MAX_CAND 512
+#define MAX_CAND 4096
 struct cand { void *ptr; void *klass; struct sig *sig; };
 static struct cand g_cand[MAX_CAND]; static int g_ncand = 0;
 
@@ -427,17 +428,18 @@ after_enum:
         if (!sg->firstPtr) { sg->firstPtr = g_cand[i].ptr; sg->firstKlass = g_cand[i].klass; }
     }
 
-    /* 6b) 特征签名判定：唯一命中且 == 老版或新版基准 RVA 即通过 */
+    /* 6b) 特征签名判定：hits==1 即解析成功（新构建 RVA 本就不在旧基线表内）；
+     *     命中已知基线额外标 KNOWN 作回归佐证，未命中基线标 RESOLVED-NEW。 */
     int sigOk = 0;
     for (size_t s = 0; s < NSIGS; s++) {
         DWORD64 got = g_sigs[s].firstPtr ? (DWORD64)((BYTE *)g_sigs[s].firstPtr - (BYTE *)ga) : 0;
-        int match = (g_sigs[s].hits == 1 &&
-                     (got == g_sigs[s].expectRva || got == g_sigs[s].expectRvaNew));
-        sigOk += match;
-        logf_("SIG[%s] hits=%d rva=0x%llX (old=%llX new=%llX) -> %s",
+        int resolved = (g_sigs[s].hits == 1);
+        int known = resolved && (got == g_sigs[s].expectRva || got == g_sigs[s].expectRvaNew);
+        sigOk += resolved;
+        logf_("SIG[%s] hits=%d rva=0x%llX -> %s",
              g_sigs[s].tag, g_sigs[s].hits, got,
-             g_sigs[s].expectRva, g_sigs[s].expectRvaNew,
-             match ? "UNIQUE-MATCH" : (g_sigs[s].hits == 0 ? "NO-HIT" : "AMBIGUOUS"));
+             !resolved ? (g_sigs[s].hits == 0 ? "NO-HIT" : "AMBIGUOUS")
+                       : (known ? "RESOLVED-KNOWN" : "RESOLVED-NEW"));
     }
     logf_("SIG-VERDICT: %d/%d", sigOk, (int)NSIGS);
 
