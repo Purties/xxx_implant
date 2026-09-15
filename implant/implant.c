@@ -416,11 +416,18 @@ after_enum:
         if (sg->callsTag) {
             struct sig *callee = sig_by_tag(sg->callsTag);
             if (!callee || !callee->firstPtr) continue;
-            BYTE *fb = (BYTE *)g_cand[i].ptr; int found = 0;
-            for (int off = 0; off + 5 <= 256; off++) {
-                if (fb[off] != 0xE8) continue;
-                int rel = *(int *)(fb + off + 1);
-                if (fb + off + 5 + rel == (BYTE *)callee->firstPtr) { found = 1; break; }
+            BYTE *fb = (BYTE *)g_cand[i].ptr;
+            /* 扫描窗钳制到函数尾（防越界"看进"邻居函数的 call）：
+             * RtlLookupFunctionEntry 查的就是本进程内存 .pdata */
+            DWORD64 base = 0;
+            RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry((DWORD64)fb, &base, NULL);
+            DWORD64 fend = rf ? (DWORD64)base + rf->EndAddress : (DWORD64)fb + 256;
+            DWORD64 lim = (DWORD64)fb + 256 < fend ? (DWORD64)fb + 256 : fend;
+            int found = 0;
+            for (BYTE *q = fb; q + 5 <= (BYTE *)lim; q++) {
+                if (q[0] != 0xE8) continue;
+                int rel = *(int *)(q + 1);
+                if (q + 5 + rel == (BYTE *)callee->firstPtr) { found = 1; break; }
             }
             if (!found) continue;
         }
