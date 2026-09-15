@@ -24,3 +24,6 @@ implant/out/
 implant/*.dll
 implant/*.exe
 implant/hooktest.exe
+
+# Python 缓存
+tools/__pycache__/

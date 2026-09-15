@@ -23,10 +23,15 @@
 
 ```powershell
 $env:PATH = 'C:\workspace\tools\mingw64\mingw64\bin;' + $env:PATH
-gcc -shared -O2 -o implant\implant.dll implant\implant.c          # 注入模块
+gcc -shared -O2 -s -o implant\implant.dll implant\implant.c          # 注入模块（-s strip 符号=反指纹要求）
 gcc -O2 -municode -o implant\inject.exe implant\inject.c -ladvapi32  # 注入器
 # 或直接: powershell -File implant\build.ps1
 ```
+
+**implant 运行控制（环境变量，注入前在启动器 shell 里 set）**：
+- `IMPLANT_OUT=<目录>`：日志输出目录（默认 %TEMP%；日志文件名 implant_<pid>.log）
+- `IMPLANT_DUMP=1`：开启全量 methods.tsv 落盘（默认关=无磁盘痕迹；做全表解析时才开）
+- `IMPLANT_HOOKTEST=1`：开启活体 detour 自测（默认关——会改写游戏活代码，仅隔离环境用）
 
 ---
 
@@ -61,9 +66,11 @@ gcc -O2 -municode -o implant\inject.exe implant\inject.c -ladvapi32  # 注入器
 | **M-2 阶段 1 POC 全绿** | 09-14 | 老客户端活体：枚举 62ms/13.8 万方法、RVA 反查 5/5、身份键 5/5；创建时注入绕开句柄剥离实锤；dispatch join 47/126 | §5.9 + poc_result.log（要点已摘录）+ dispatch_identity.tsv |
 | **M-3 跨构建判别** | 09-14 | 哈希逐构建轮换（0/7，控制组有效）→ 身份键仅构建内有效 | §5.9.5 + xbuild_identity_check.py |
 | **M-4 特征签名架构定案** | 09-14 | 掩码签名（老/新自动 diff）+ 结构约束（C=同类+call I）；离线两版唯一 + 老客户端活体 5/5；detour 引擎离线单测 PASS；纯离线字节法上限 ~24/126 实锤 | §5.9.5b + sig_design.py + hooktest.c |
-| **M-5 新版现场闭环（当前）** | 09-15 | 登录器启动新版游戏 + `--race` 竞速注入成功；SIG-VERDICT 5/5 全中新版 RVA；新版 13.8 万方法表入库 | §5.9.5c + methods_new_0915.tsv + poc_newbuild_run.log |
+| **M-5 新版现场闭环** | 09-15 | 登录器启动新版游戏 + `--race` 竞速注入成功；SIG-VERDICT 5/5 全中新版 RVA；新版 13.8 万方法表入库 | §5.9.5c + methods_new_0915.tsv |
+| **M-6 第三构建终验+重构** | 09-15 | 游戏再次更新（0c06cc8c）：4/5→修复 C 函数尾钳制→**5/5 全 RESOLVED-NEW 零人工**；代码评审重构（去开发机路径/strip/VEH 用完即卸/落盘默认关/hooktest 目标修复） | §5.9.5d + poc_build3_refactor.log + poc_build3_run.log |
+| **M-7 签名法推广 126（当前）** | 09-15 | 28 个已配对目标跑双版 diff+第三版校验→**21 条三构建唯一签名**编入 `implant/sigs126.inc`（静态映像扫描通道）；--spawn 活体 **SIG126-VERDICT 21/21**；启发式单版掩码/hash-join 配对两路被已知答案实验否决 | §5.9.5e + sig126_paired.py + poc_sig126_run.log |
 
-**M-5 含义**：钩子定位问题彻底解决且不依赖人工每构建维护。阶段 1 收官。
+**M-5/M-6/M-7 含义**：钩子定位问题彻底解决且不依赖人工每构建维护——连续两次真实游戏更新（ba7b80fc→0c06cc8c）零干预全解析；dispatch 目标覆盖 5→23 个（21 静态+5 钩）。阶段 1 收官。
 
 ---
 

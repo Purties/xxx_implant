@@ -17,14 +17,16 @@
 #include <string.h>
 #include <setjmp.h>
 
-/* 枚举期崩溃恢复：VEH 把危险区异常 longjmp 回类循环安全点 */
+/* 枚举期崩溃恢复：VEH 把危险区异常 longjmp 回类循环安全点（枚举结束即卸载） */
 static jmp_buf g_jmp;
 static volatile LONG g_inDanger = 0;
-static void *g_curKlass = NULL;
+static void *g_veh = NULL;
+static LONG WINAPI veh(EXCEPTION_POINTERS *ep);
 
-/* ---- 结果输出（非特征化文件名） ---- */
-static const char *g_logPath = "c:\\workspace\\9-4#2\\implant\\out\\poc_result.log";
-static const char *g_dumpPath = "c:\\workspace\\9-4#2\\implant\\out\\methods.tsv";
+/* ---- 结果输出：路径经环境变量 IMPLANT_OUT 配置，默认 %TEMP%；
+ * 不硬编码开发机路径、不写游戏目录（反指纹硬性要求） ---- */
+static char g_logPath[MAX_PATH];
+static char g_dumpPath[MAX_PATH];
 static FILE *g_log;
 static FILE *g_dump;
 static CRITICAL_SECTION g_cs;
@@ -146,6 +148,10 @@ static struct sig g_sigs[] = {
 };
 #define NSIGS (sizeof(g_sigs)/sizeof(g_sigs[0]))
 
+/* ---- 批量 dispatch 签名（tools/sig126_paired.py 三构建离线 diff 生成）----
+ * 覆盖含"函数体内"目标（方法枚举无法命中），故用静态映像字节扫描而非枚举。 */
+#include "sigs126.inc"
+
 /* 约束型签名：先收集全部掩码命中候选，枚举结束后再解约束（不依赖方法遍历顺序）
  * C 用松掩码（~1800 命中），故缓冲上限需覆盖之；D 用 wantParams 即时过滤不缓冲。 */
 struct sig;
@@ -158,16 +164,6 @@ static struct sig *sig_by_tag(const char *tag) {
     return NULL;
 }
 
-static int parse_hex_mask(const char *mask, BYTE *out, int maxn) {
-    int n = 0; const char *p = mask;
-    while (*p && n < maxn) {
-        while (*p == ' ') p++;
-        if (!*p) break;
-        if (p[0] == '?') { out[n++] = 0; p += 1; }
-        else { unsigned v; sscanf(p, "%2x", &v); out[n++] = (BYTE)v; p += 2; }
-    }
-    return n;
-}
 static int mask_match(const BYTE *data, const char *mask) {
     int i = 0; const char *p = mask;
     for (; *p; ) {
@@ -244,7 +240,10 @@ static int install_detour(void *target, void *hook, fn2 *trampOut) {
 static DWORD WINAPI worker(LPVOID param) {
     (void)param;
     size_t abortClass = 0;
-    logf_("worker start, pid=%lu", GetCurrentProcessId());
+    /* DllMain 已返回（loader lock 释放）：此处才做文件 I/O 与 VEH 注册 */
+    g_log = fopen(g_logPath, "a");
+    logf_("==== implant attached, pid=%lu", GetCurrentProcessId());
+    g_veh = AddVectoredExceptionHandler(1, veh);
 
     /* 1) 等待 GameAssembly.dll */
     HMODULE ga = NULL;
@@ -270,10 +269,13 @@ static DWORD WINAPI worker(LPVOID param) {
         logf_("target[%s/%s] = base+0x%llX = %p", g_targets[t].tag, g_targets[t].ver,
              g_targets[t].rva, (void *)((BYTE *)ga + g_targets[t].rva));
 
-    /* 3b) 打开全量方法导出文件 */
-    g_dump = fopen(g_dumpPath, "w");
-    if (g_dump) fputs("rva\timage\tnamespace\tclass\tmethod\tparams\n", g_dump);
-    else logf_("WARN: cannot open dump file");
+    /* 3b) 全量方法导出：仅当 IMPLANT_DUMP=1 时落盘（诊断模式；默认关闭=无磁盘痕迹） */
+    char envd[8] = {0};
+    if (GetEnvironmentVariableA("IMPLANT_DUMP", envd, sizeof(envd)) > 0) {
+        g_dump = fopen(g_dumpPath, "w");
+        if (g_dump) fputs("rva\timage\tnamespace\tclass\tmethod\tparams\n", g_dump);
+        else logf_("WARN: cannot open dump file");
+    }
 
     /* 4) 枚举 assemblies → images → classes → methods，反查目标 */
     size_t nAsm = 0;
@@ -378,6 +380,7 @@ static DWORD WINAPI worker(LPVOID param) {
     }
     g_inDanger = 0;   /* 整轮枚举安全结束 */
 after_enum:
+    if (g_veh) { RemoveVectoredExceptionHandler(g_veh); g_veh = NULL; }  /* 枚举后不留 VEH 痕迹 */
     if (g_dump) { fflush(g_dump); fclose(g_dump); g_dump = NULL; logf_("methods.tsv written"); }
 
     logf_("enumeration done in %llu ms: classes=%zu methods=%zu",
@@ -450,14 +453,56 @@ after_enum:
     }
     logf_("SIG-VERDICT: %d/%d", sigOk, (int)NSIGS);
 
+    /* 6c) 批量 dispatch 签名：静态扫描 GA 已映射映像（含函数体内目标，不依赖枚举）。
+     *     掩码锚定首个精确字节用 memchr 加速；每签名最多记 2 个命中以判歧义。 */
+    {
+        int s126ok = 0;
+        for (size_t s = 0; s < NSIGS126; s++) {
+            struct sig *sg = &g_sigs126[s];
+            /* 解析掩码到字节数组（静态签名最长 256） */
+            static BYTE mb[256]; static BYTE mw[256];  /* 值/掩码位图 */
+            int ml = 0; const char *p = sg->mask;
+            while (*p && ml < 256) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                if (*p == '?') { mb[ml] = 0; mw[ml] = 0; p++; ml++; continue; }
+                unsigned v; sscanf(p, "%2x", &v);
+                mb[ml] = (BYTE)v; mw[ml] = 1; ml++; p += 2;
+            }
+            int first = 0; while (first < ml && !mw[first]) first++;
+            int anchor = mb[first];
+            int hits = 0; DWORD64 hitRva = 0;
+            for (BYTE *q = (BYTE *)ga; q + first < gaEnd; ) {
+                q = (BYTE *)memchr(q + first, anchor, (size_t)(gaEnd - (q + first)));
+                if (!q) break;
+                BYTE *st = q - first;
+                if (st + ml > gaEnd) break;
+                int okm = 1;
+                for (int i = 0; i < ml; i++)
+                    if (mw[i] && st[i] != mb[i]) { okm = 0; break; }
+                if (okm) { hits++; if (hits == 1) hitRva = (DWORD64)(st - (BYTE *)ga); if (hits > 1) break; }
+                q = st + 1;
+            }
+            sg->hits = hits;
+            if (hits == 1) {
+                s126ok++;
+                logf_("SIG126[%s] rva=0x%llX %s", sg->tag, hitRva,
+                      hitRva == sg->expectRvaNew ? "-> RESOLVED-KNOWN" : "-> RESOLVED");
+            } else {
+                logf_("SIG126[%s] hits=%d %s", sg->tag, hits, hits ? "-> AMBIGUOUS" : "-> NO-HIT");
+            }
+        }
+        logf_("SIG126-VERDICT: %d/%d", s126ok, (int)NSIGS126);
+    }
+
     /* 7) 端到端功能自测（默认关闭！会改写游戏活代码，仅在隔离/离线验证时开启）
      *    开启方式：环境变量 IMPLANT_HOOKTEST=1 */
     {
         char envb[8] = {0};
         int enable = GetEnvironmentVariableA("IMPLANT_HOOKTEST", envb, sizeof(envb)) > 0;
         if (!enable) logf_("HOOKTEST disabled (set IMPLANT_HOOKTEST=1 to enable)");
-        if (enable && g_idents[0].resolved) {
-            void *target = g_idents[0].resolved;               /* SetVelocity */
+        if (enable && g_sigs[0].firstPtr) {
+            void *target = g_sigs[0].firstPtr;               /* SetVelocity（签名解析，跨构建有效） */
             BYTE *fake = VirtualAlloc(NULL, 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (fake && install_detour(target, (void *)hook_V, &g_trampV)) {
                 fn2 callV = (fn2)target;                        /* 经钩子路径 */
@@ -499,11 +544,12 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     (void)hinst; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         InitializeCriticalSection(&g_cs);
-        char dir[MAX_PATH];
-        GetModuleFileNameA(NULL, dir, MAX_PATH);   /* 记录宿主，诊断用 */
-        g_log = fopen(g_logPath, "a");
-        logf_("==== implant attached into: %s", dir);
-        AddVectoredExceptionHandler(1, veh);
+        /* 输出目录：IMPLANT_OUT 环境变量 > %TEMP%；不硬编码开发机路径 */
+        char outdir[MAX_PATH];
+        if (!GetEnvironmentVariableA("IMPLANT_OUT", outdir, sizeof(outdir)) || !outdir[0])
+            GetTempPathA(sizeof(outdir), outdir);
+        _snprintf(g_logPath, sizeof(g_logPath), "%simplant_%lu.log", outdir, GetCurrentProcessId());
+        _snprintf(g_dumpPath, sizeof(g_dumpPath), "%simplant_%lu_methods.tsv", outdir, GetCurrentProcessId());
         HANDLE th = CreateThread(NULL, 0, worker, NULL, 0, NULL);
         if (th) CloseHandle(th);
     }
