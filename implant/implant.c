@@ -129,6 +129,7 @@ static struct ident g_idents[] = {
  */
 struct sig { const char *tag; const char *mask; int len; DWORD64 expectRva;
              DWORD64 expectRvaNew;     /* 新版构建基准（§5.7.1），两版任一命中即 PASS */
+             int wantParams;           /* >=0 则要求方法参数数==此值（运行时结构约束，跨构建稳定） */
              const char *sameClassAs;  /* 非空则要求命中方法与该 tag 同属一个类（结构约束消歧） */
              const char *callsTag;     /* 非空则要求命中方法体内前 256B 有 call 到该 tag 的方法 */
              int hits; void *firstPtr; void *firstKlass; };
@@ -136,11 +137,12 @@ static struct sig g_sigs[] = {
     /* 5 条签名由 tools/sig_design.py 从老/新两版 GA 逐字节 diff 自动掩码生成，
      * 两版各自唯一命中期望 RVA（跨构建唯一性已离线证明）。
      * C 序言通用（56B 前缀活体 108 命中），用"与 V 同类 + 体内 call I"结构约束收敛。 */
-    { "V", "48 89 91 F8 00 00 00 0F B6 05 ? ? ? 05 ? ?", 16, 0x11BE640, 0x12144F0, NULL, NULL, 0, NULL, NULL },
-    { "I", "56 57 53 48 81 EC ? 01 00 00 44 0F 29 84 24 ? 01 00 00 0F 29 BC 24 ? 01 00 00 0F 29 B4 24 ? 01 00 00 66 0F 28 F2 66 0F 28 F9 48 89 CE 48 8D", 48, 0x11BE670, 0x1214940, NULL, NULL, 0, NULL, NULL },
-    { "C", "48 83 EC ? 48 8D 05 ? 00 00 00 48 89 44 24 ? 48 8B 44 24 ? 48 89 05 ? ? ? 05 48 8D 05 ? 00 00 00 48 89 44 24 ? 48", 56, 0x11BEF10, 0x1215270, "V", "I", 0, NULL, NULL },
-    { "D", "41 57 41 56 41 55 41 54 56 57 55 53 B8 ? 12 00 00 E8 ? ? ? FF 48 29 C4 0F 29 BC 24 ? 12 00", 32, 0x1049B70, 0x10D74B0, NULL, NULL, 0, NULL, NULL },
-    { "U", "E9 0B 00 00 00 66 66 2E 0F 1F 84 00 00 00 00 00 56 57 53 48 81 EC ? ? 00 00 48 89 CE 48 8D 05 ? ? 00 00 48 89 84 24 ? ? 00 00 48 8D 0D ?", 48, 0x1660650, 0x14DB0B0, NULL, NULL, 0, NULL, NULL },
+    /* wantParams：D=10（SetDamaged 极独特参数数，用于运行时消歧；-1=不约束） */
+    { "V", "48 89 91 F8 00 00 00 0F B6 05 ? ? ? 05 ? ?", 16, 0x11BE640, 0x12144F0, -1, NULL, NULL, 0, NULL, NULL },
+    { "I", "56 57 53 48 81 EC ? 01 00 00 44 0F 29 84 24 ? 01 00 00 0F 29 BC 24 ? 01 00 00 0F 29 B4 24 ? 01 00 00 66 0F 28 F2 66 0F 28 F9 48 89 CE 48 8D", 48, 0x11BE670, 0x1214940, -1, NULL, NULL, 0, NULL, NULL },
+    { "C", "48 83 EC ? 48 8D 05 ? 00 00 00 48 89 44 24 ? 48 8B 44 24 ? 48 89 05 ? ? ? 05 48 8D 05 ? 00 00 00 48 89 44 24 ? 48", 56, 0x11BEF10, 0x1215270, -1, "V", "I", 0, NULL, NULL },
+    { "D", "41 57 41 56 41 55 41 54 56 57 55 53 B8 ? ? ? ? E8 ? ? ? FF 48 29 C4", 26, 0x1049B70, 0x10D74B0, 10, NULL, NULL, 0, NULL, NULL },
+    { "U", "E9 0B 00 00 00 66 66 2E 0F 1F 84 00 00 00 00 00 56 57 53 48 81 EC ? ? 00 00 48 89 CE 48 8D 05 ? ? 00 00 48 89 84 24 ? ? 00 00 48 8D 0D ?", 48, 0x1660650, 0x14DB0B0, -1, NULL, NULL, 0, NULL, NULL },
 };
 #define NSIGS (sizeof(g_sigs)/sizeof(g_sigs[0]))
 
@@ -340,6 +342,7 @@ static DWORD WINAPI worker(LPVOID param) {
                 if (fp && (BYTE *)fp >= (BYTE *)ga && (BYTE *)fp < gaEnd) {
                     for (size_t s = 0; s < NSIGS; s++) {
                         if (!mask_match((BYTE *)fp, g_sigs[s].mask)) continue;
+                        if (g_sigs[s].wantParams >= 0 && nargs != g_sigs[s].wantParams) continue;
                         if (g_sigs[s].sameClassAs || g_sigs[s].callsTag) {
                             /* 约束型：收集候选，枚举后解约束 */
                             if (g_ncand < MAX_CAND) {

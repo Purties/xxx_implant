@@ -84,8 +84,8 @@ static int do_inject(HANDLE hProc, const char *dllA) {
 
 static int race_inject(const wchar_t *exeName, const char *dllA, DWORD baselinePid) {
     enable_debug_priv();
-    wprintf(L"racing for '%ls' (baseline pid=%lu)... 2min window\n", exeName, baselinePid);
-    DWORD deadline = GetTickCount() + 120000;   /* 2 分钟窗口 */
+    wprintf(L"racing for '%ls' (baseline pid=%lu)... 5min window\n", exeName, baselinePid);
+    DWORD deadline = GetTickCount() + 300000;   /* 5 分钟窗口 */
     while (GetTickCount() < deadline) {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap == INVALID_HANDLE_VALUE) { Sleep(1); continue; }
